@@ -7,12 +7,12 @@
 #define SAMPLING_FREQUENCY 16000 // 16 kHz sampling rate (Nyquist bandwidth: 0 to 8 kHz)
                                  // Bin resolution = 16000 / 512 = 31.25 Hz per bin (Bin 1 = 31.25 Hz)
 
-double vReal[SAMPLES];
-double vImag[SAMPLES];
-ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+double fftReal[SAMPLES];
+double fftImag[SAMPLES];
+ArduinoFFT<double> FFT = ArduinoFFT<double>(fftReal, fftImag, SAMPLES, SAMPLING_FREQUENCY);
 
 // minimum energy threshold to reject background acoustic noise
-const double MOSQUITO_THRESHOLD = 80000;
+const double MOSQUITO_ENERGY_THRESHOLD = 80000;
 
 #if CONFIG_FREERTOS_UNICORE
   static const BaseType_t app_cpu = 0;
@@ -22,7 +22,7 @@ const double MOSQUITO_THRESHOLD = 80000;
 
 static const int PAN_PIN       = 13;
 static const int TILT_PIN      = 14;
-static const int RADAR_OUT     = 18;
+static const int RADAR_PIN     = 18;
 static const int LED_R         = 27;
 static const int LED_Y         = 26;
 static const int LED_G         = 23;
@@ -62,7 +62,7 @@ void taskSensors(void *parameter) {
 
   while (1) {
     // mmWave Radar Read with Software Hysteresis
-    bool rawRadar = (digitalRead(RADAR_OUT) == HIGH);
+    bool rawRadar = (digitalRead(RADAR_PIN) == HIGH);
     if (rawRadar) {
         lastMotionTime = millis();
     }
@@ -84,17 +84,18 @@ void taskSensors(void *parameter) {
       
       for (int i = 0; i < SAMPLES; i++) {
         if (i < samplesRead) {
-          vReal[i] = (double)(i2sBuffer[i] >> 14) - mean;
+          fftReal[i] = (double)(i2sBuffer[i] >> 14) - mean;
         } else {
-          vReal[i] = 0.0;
+          fftReal[i] = 0.0;
         }
-        vImag[i] = 0.0;
+        fftImag[i] = 0.0;
       }
 
       // Fast Fourier Transform (FFT) Analysis
       FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward); 
       FFT.compute(FFTDirection::Forward);
       FFT.complexToMagnitude();
+      const double *magnitude = fftReal; // complexToMagnitude() overwrites fftReal in place with bin magnitudes
       
       // for testing the sound frequency
       double dominantFreq = FFT.majorPeak();
@@ -103,19 +104,19 @@ void taskSensors(void *parameter) {
 
       // Fundamental Band Extraction (Bins 13 to 26: ~406 Hz - 812 Hz)  (13 * 31.25 Hz to 26 * 31.25 Hz)
       double mosquitoEnergy = 0;
-      double maxMosquitoBin = 0;
+      double peakFundamentalMag = 0;
       for (int i = 13; i <= 26; i++) {
-        mosquitoEnergy += vReal[i];
-        if (vReal[i] > maxMosquitoBin) {
-          maxMosquitoBin = vReal[i]; // Peak narrow-band power detection
+        mosquitoEnergy += magnitude[i];
+        if (magnitude[i] > peakFundamentalMag) {
+          peakFundamentalMag = magnitude[i]; // Peak narrow-band power detection
         }
       }
 
       // Harmonic Band Extraction (Bins 29 to 51: ~906 Hz - 1593 Hz)  (29 * 31.25 Hz to 51 * 31.25 Hz)
-      double maxHarmonicBin = 0;
+      double peakHarmonicMag = 0;
       for (int i = 29; i <= 51; i++) {
-        if (vReal[i] > maxHarmonicBin) {
-          maxHarmonicBin = vReal[i]; // Second harmonic overtone detection
+        if (magnitude[i] > peakHarmonicMag) {
+          peakHarmonicMag = magnitude[i]; // Second harmonic overtone detection
         }
       }
       
@@ -124,7 +125,7 @@ void taskSensors(void *parameter) {
       int noiseBins = 0;
       for (int i = 2; i < (SAMPLES / 2); i++) {
         if (i < 13 || i > 51) {
-          noiseFloor += vReal[i];
+          noiseFloor += magnitude[i];
           noiseBins++;
         }
       }
@@ -134,8 +135,8 @@ void taskSensors(void *parameter) {
       
       // Narrowband Classification & Impulse Filtering
       // Rejects broadband impulses (hand claps) where noiseFloor rises equally
-      if (isMosquitoPitch && maxMosquitoBin > (noiseFloor * 4.0) && mosquitoEnergy > MOSQUITO_THRESHOLD) {   
-        if (maxHarmonicBin > (noiseFloor * 2.0)) {
+      if (isMosquitoPitch && peakFundamentalMag > (noiseFloor * 4.0) && mosquitoEnergy > MOSQUITO_ENERGY_THRESHOLD) {   
+        if (peakHarmonicMag > (noiseFloor * 2.0)) {
             consecutiveMosquitoReads++; // Verified fundamental + harmonic signature
         } else {
             consecutiveMosquitoReads = 0; // Failed the harmonic check. Reset to 0.
@@ -295,7 +296,7 @@ void setup() {
   vTaskDelay(pdMS_TO_TICKS(1000));
 
   // Initialize Standard GPIO
-  pinMode(RADAR_OUT, INPUT_PULLDOWN);
+  pinMode(RADAR_PIN, INPUT_PULLDOWN);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_Y, OUTPUT);
   pinMode(LED_G, OUTPUT);
@@ -307,7 +308,7 @@ void setup() {
   tiltServo.attach(TILT_PIN);
 
   // Initialize I2S Controller for INMP441 Microphone
-  i2s_config_t i2s_config = {
+  i2s_config_t micI2sConfig = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 16000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
@@ -320,14 +321,14 @@ void setup() {
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
-  i2s_pin_config_t pin_config = {
+  i2s_pin_config_t micI2sPins = {
     .bck_io_num = I2S_SCK,
     .ws_io_num = I2S_WS,
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_SD
   };
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_driver_install(I2S_NUM_0, &micI2sConfig, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &micI2sPins);
 
   // Mutex creation with Priority Inheritance enabled by default
   stateMutex = xSemaphoreCreateMutex();
