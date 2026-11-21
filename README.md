@@ -1,4 +1,4 @@
-# Autonomous-Mosquito-Detector
+# Autonomous Mosquito Detector
  
 An ESP32 pan-tilt turret that patrols a room, wakes up when a **24 GHz mmWave radar** senses movement, and confirms a mosquito by **listening for its wingbeat** with an I2S digital microphone and a 512-point FFT. The firmware runs on **FreeRTOS**, with three tasks sharing one mutex-protected state.
  
